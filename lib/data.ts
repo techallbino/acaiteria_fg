@@ -143,12 +143,6 @@ export const ADICIONAIS: OptionGroup = {
       image: img('sucrilhos-chocoball'),
     },
     {
-      id: 'add-nutella',
-      name: 'Nutella',
-      price: 4,
-      image: img('nutella'),
-    },
-    {
       id: 'add-ovomaltine',
       name: 'Ovomaltine',
       price: 3,
