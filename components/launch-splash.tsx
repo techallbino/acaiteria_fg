@@ -28,6 +28,19 @@ export function LaunchSplash() {
     <div
       aria-hidden="true"
       className={`fg-launch-splash ${leaving ? 'fg-launch-splash--leaving' : ''}`}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        zIndex: 99999,
+        display: 'flex',
+        minHeight: '100dvh',
+        alignItems: 'center',
+        justifyContent: 'center',
+        flexDirection: 'column',
+        overflow: 'hidden',
+        background:
+          'radial-gradient(circle at 50% 43%, rgba(109, 38, 84, 0.5), transparent 36%), linear-gradient(145deg, #2d1027 0%, #190916 54%, #10070e 100%)',
+      }}
     >
       <div className="fg-launch-glow" />
 
