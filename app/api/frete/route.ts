@@ -1,5 +1,4 @@
 import { NextResponse } from 'next/server'
-import { STORE, FREIGHT } from '@/lib/data'
 
 type ViaCep = {
   cep: string
@@ -10,15 +9,13 @@ type ViaCep = {
   erro?: boolean
 }
 
-const KNOWN_CEPS: Record<string, ViaCep & { lat: number; lng: number }> = {
+const KNOWN_CEPS: Record<string, ViaCep> = {
   '06361400': {
     cep: '06361-400',
     logradouro: 'Estrada do Jacarandá',
     bairro: 'Alto de Santa Lúcia',
     localidade: 'Carapicuíba',
     uf: 'SP',
-    lat: -23.5558507,
-    lng: -46.8453525,
   },
   '06386000': {
     cep: '06386-000',
@@ -26,149 +23,120 @@ const KNOWN_CEPS: Record<string, ViaCep & { lat: number; lng: number }> = {
     bairro: 'Vila Mercês',
     localidade: 'Carapicuíba',
     uf: 'SP',
-    lat: -23.5360509,
-    lng: -46.8416146,
   },
 }
 
-function haversineKm(aLat: number, aLng: number, bLat: number, bLng: number): number {
-  const R = 6371
-  const dLat = ((bLat - aLat) * Math.PI) / 180
-  const dLng = ((bLng - aLng) * Math.PI) / 180
-  const lat1 = (aLat * Math.PI) / 180
-  const lat2 = (bLat * Math.PI) / 180
-  const h =
-    Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2
-  return 2 * R * Math.asin(Math.sqrt(h))
+const FRETES_POR_CIDADE: Record<string, number> = {
+  carapicuiba: 10,
+  osasco: 20,
+  barueri: 13,
+  jandira: 11,
 }
 
-function calcFee(km: number): number {
-  const raw = Math.max(FREIGHT.baseFee, km * FREIGHT.perKm)
-  const capped = Math.min(FREIGHT.maxFee, raw)
-  // arredonda para múltiplos de R$ 0,50
-  return Math.round(capped * 2) / 2
+function normalizarCidade(cidade: string): string {
+  return cidade
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase()
 }
 
-function estimateRoadKm(straightKm: number): number {
-  // Haversine mede linha reta. Em trajetos urbanos curtos, ruas, retornos e
-  // acessos tornam o percurso proporcionalmente maior (ex.: 0,7 km -> ~2,1 km).
-  if (straightKm < 1) return straightKm * 3
-  if (straightKm < 3) return straightKm * 1.45
-  return straightKm * 1.3
+function cidadePorFaixaDeCep(cep: string): string | null {
+  const prefixo = Number(cep.slice(0, 5))
+
+  if (prefixo >= 6000 && prefixo <= 6299) return 'Osasco'
+  if (prefixo >= 6300 && prefixo <= 6399) return 'Carapicuíba'
+  if (prefixo >= 6400 && prefixo <= 6499) return 'Barueri'
+  if (prefixo >= 6600 && prefixo <= 6649) return 'Jandira'
+
+  return null
 }
 
-async function geocode(query: string): Promise<{ lat: number; lng: number } | null> {
+async function buscarEndereco(cep: string): Promise<ViaCep | null> {
+  if (KNOWN_CEPS[cep]) return KNOWN_CEPS[cep]
+
   try {
-    const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=br&q=${encodeURIComponent(
-      query,
-    )}`
-    const res = await fetch(url, {
-      headers: { 'User-Agent': 'FG-Acaiteria/1.0 (pedido delivery)' },
+    const response = await fetch(`https://viacep.com.br/ws/${cep}/json/`, {
       cache: 'no-store',
+      signal: AbortSignal.timeout(4500),
     })
-    if (!res.ok) return null
-    const data = (await res.json()) as Array<{ lat: string; lon: string }>
-    if (!data.length) return null
-    return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) }
+
+    if (response.ok) {
+      const data = (await response.json()) as ViaCep
+      if (!data.erro) return data
+    }
   } catch {
-    return null
+    // Tenta o segundo provedor abaixo.
   }
+
+  try {
+    const response = await fetch(`https://brasilapi.com.br/api/cep/v1/${cep}`, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(4500),
+    })
+
+    if (response.ok) {
+      const data = (await response.json()) as {
+        cep: string
+        street: string
+        neighborhood: string
+        city: string
+        state: string
+      }
+
+      return {
+        cep: data.cep,
+        logradouro: data.street,
+        bairro: data.neighborhood,
+        localidade: data.city,
+        uf: data.state,
+      }
+    }
+  } catch {
+    // O fallback por faixa de CEP é aplicado no handler.
+  }
+
+  return null
 }
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url)
-  const cepRaw = (searchParams.get('cep') || '').replace(/\D/g, '')
+  const cep = (searchParams.get('cep') || '').replace(/\D/g, '')
 
-  if (cepRaw.length !== 8) {
-    return NextResponse.json({ error: 'CEP inválido' }, { status: 400 })
+  if (cep.length !== 8) {
+    return NextResponse.json({ error: 'CEP inválido.' }, { status: 400 })
   }
 
-  // 1) Endereço via ViaCEP. Se o provedor estiver indisponível no ambiente
-  // de hospedagem, tentamos BrasilAPI e depois um fallback seguro.
-  let endereco: ViaCep | null = KNOWN_CEPS[cepRaw] || null
-  if (!endereco) try {
-    const res = await fetch(`https://viacep.com.br/ws/${cepRaw}/json/`, {
-      cache: 'no-store',
-      signal: AbortSignal.timeout(4500),
-    })
-    if (res.ok) {
-      const data = (await res.json()) as ViaCep
-      if (!data.erro) endereco = data
-    }
-  } catch {
-    endereco = null
+  const endereco = await buscarEndereco(cep)
+  const cidade = endereco?.localidade || cidadePorFaixaDeCep(cep)
+
+  if (!cidade) {
+    return NextResponse.json(
+      { error: 'Este CEP está fora da região de entrega.' },
+      { status: 422 },
+    )
   }
 
-  if (!endereco) {
-    try {
-      const res = await fetch(`https://brasilapi.com.br/api/cep/v1/${cepRaw}`, {
-        cache: 'no-store',
-        signal: AbortSignal.timeout(4500),
-      })
-      if (res.ok) {
-        const data = (await res.json()) as { cep: string; street: string; neighborhood: string; city: string; state: string }
-        endereco = { cep: data.cep, logradouro: data.street, bairro: data.neighborhood, localidade: data.city, uf: data.state }
-      }
-    } catch {
-      endereco = null
-    }
-  }
+  const fee = FRETES_POR_CIDADE[normalizarCidade(cidade)]
 
-  if (!endereco && KNOWN_CEPS[cepRaw]) endereco = KNOWN_CEPS[cepRaw]
-
-  if (!endereco) {
-    // Quando os provedores externos estão fora do ar, a região próxima continua
-    // funcionando com uma estimativa local por faixa de CEP.
-    const prefix3 = Number(cepRaw.slice(0, 3))
-    const localRegion =
-      prefix3 >= 60 && prefix3 <= 62 ? { city: 'Osasco', baseKm: 7 + (62 - prefix3) * 1.5 } :
-      prefix3 === 63 ? { city: 'Carapicuíba', baseKm: 1.5 } :
-      prefix3 === 64 ? { city: 'Barueri', baseKm: 8 } :
-      prefix3 === 65 ? { city: 'Santana de Parnaíba', baseKm: 12 } :
-      prefix3 === 66 ? { city: 'Jandira / Itapevi', baseKm: 10 } :
-      prefix3 === 67 ? { city: 'Cotia e região', baseKm: 12 } : null
-
-    if (localRegion) {
-      const prefix = Number(cepRaw.slice(0, 5))
-      const variation = (prefix % 100) * 0.035
-      const estimatedKm = Math.min(18, localRegion.baseKm + variation)
-      return NextResponse.json({
-        cep: `${cepRaw.slice(0, 5)}-${cepRaw.slice(5)}`,
-        logradouro: 'Endereço informado',
-        bairro: localRegion.city,
-        cidade: localRegion.city,
-        uf: 'SP',
-        distanceKm: Number(estimatedKm.toFixed(1)),
-        fee: calcFee(estimatedKm),
-        estimated: true,
-      })
-    }
-    return NextResponse.json({ error: 'Este CEP está fora da região de entrega.' }, { status: 422 })
-  }
-
-  // 2) Geocodifica para calcular distância
-  const q1 = `${endereco.logradouro}, ${endereco.bairro}, ${endereco.localidade}, ${endereco.uf}`
-  const q2 = `${endereco.localidade}, ${endereco.uf}`
-  let coords = KNOWN_CEPS[cepRaw]
-    ? { lat: KNOWN_CEPS[cepRaw].lat, lng: KNOWN_CEPS[cepRaw].lng }
-    : await geocode(q1)
-  if (!coords) coords = await geocode(q2)
-
-  let distanceKm: number | null = null
-  let fee = FREIGHT.baseFee + 3 // fallback caso a geocodificação falhe
-
-  if (coords) {
-    distanceKm = estimateRoadKm(haversineKm(STORE.lat, STORE.lng, coords.lat, coords.lng))
-    fee = calcFee(distanceKm)
+  if (fee === undefined) {
+    return NextResponse.json(
+      {
+        error:
+          'No momento, entregamos somente em Carapicuíba, Osasco, Barueri e Jandira.',
+      },
+      { status: 422 },
+    )
   }
 
   return NextResponse.json({
-    cep: endereco.cep,
-    logradouro: endereco.logradouro,
-    bairro: endereco.bairro,
-    cidade: endereco.localidade,
-    uf: endereco.uf,
-    distanceKm: distanceKm ? Number(distanceKm.toFixed(1)) : null,
+    cep: endereco?.cep || `${cep.slice(0, 5)}-${cep.slice(5)}`,
+    logradouro: endereco?.logradouro || 'Endereço informado',
+    bairro: endereco?.bairro || cidade,
+    cidade,
+    uf: endereco?.uf || 'SP',
+    distanceKm: null,
     fee,
+    fixedFee: true,
   })
 }
